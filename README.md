@@ -38,6 +38,7 @@ Problems are organized into **groups** by domain. Each problem belongs to exactl
 | `cccl` | C++ | Thrust, CUB, libcu++ |
 | `cublas` | C++ | BLAS levels 1-3, extensions, applications |
 | `mathlibs` | C++ | cuSPARSE, cuSOLVER, cuFFT, cuRAND |
+| `sparse` | C++ | cuSPARSE Generic API — SpMM, SpMV, SpSV, SpSM, SpGEMM, SDDMM, format conversion, sparse vector ops (extracted from `mathlibs` for focused sparse benchmarking; see [`SPARSE_BENCH_README.md`](SPARSE_BENCH_README.md)) |
 | `cudnn` | C++ | Convolutions, attention, matmul, normalization via cuDNN Graph API |
 | `cutile` | Python | Tile-based kernels: matmul, attention, normalization, element-wise ops (SM 10.0+) |
 

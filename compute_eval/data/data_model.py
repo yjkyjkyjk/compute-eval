@@ -81,6 +81,9 @@ class SourceFile(BaseModel):
 #: - cccl: CCCL (CUDA C++ Core Libraries) - Thrust, CUB, and libcu++
 #: - cublas: cuBLAS - Dense linear algebra (BLAS levels 1-3, extensions)
 #: - mathlibs: Math Libraries - cuSPARSE, cuSOLVER, cuFFT, cuRAND
+#: - sparse: Sparse Matrix Operators - cuSPARSE Generic API (SpMM, SpMV, SpSV, SpSM,
+#:   SpGEMM, SDDMM, format conversion, sparse vector ops); extracted from mathlibs
+#:   for focused sparse-operator benchmarking
 #: - cutile: cuTile - Tile-based programming with cuTile kernels and patterns
 #: - cudnn: cuDNN - Deep Neural Network library (convolutions, pooling,
 #:   normalization, activations using cuDNN Graph API)
@@ -90,6 +93,7 @@ ValidGroup = Literal[
     "cccl",
     "cublas",
     "mathlibs",
+    "sparse",
     "cutile",
     "cudnn",
 ]
