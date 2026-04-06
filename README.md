@@ -1,584 +1,358 @@
-# ComputeEval
+# SparseBench
 
-A benchmark for evaluating LLM-generated CUDA code on **correctness** and **performance**.
+**SparseBench** 是基于 [ComputeEval](README.md) 构建的针对 LLM 生成**稀疏矩阵算子**代码的专项评测体系，聚焦于 NVIDIA cuSPARSE 库的正确性、性能与 API 规范性三个维度。
 
-ComputeEval provides a growing set of handcrafted CUDA programming challenges — spanning kernels, runtime APIs, and GPU libraries — along with tooling to generate, compile, and evaluate solutions from any LLM. Each problem includes a held-out test harness for functional correctness and can optionally include a performance benchmark that measures GPU execution time against a baseline solution.
+> 本项目在 `mathlibs` 组的 101 道题目基础上，筛选并扩展了全部 29 道 cuSPARSE 问题，同时设计了一套面向稀疏计算场景的评测方法论。
 
-The benchmark is under active development with frequent updates. New problems, domain groups, and evaluation capabilities are added in each release — see the [changelog](CHANGELOG.md) for details.
+---
 
-## Benchmark Structure and Evaluation
+## 目录
 
-### Problem Organization
+- [背景与动机](#背景与动机)
+- [cuSPARSE 问题集](#cusparse-问题集)
+  - [完整列表](#完整列表)
+  - [按算子族分类](#按算子族分类)
+- [评测体系设计](#评测体系设计)
+  - [评测维度](#评测维度)
+  - [评测流水线](#评测流水线)
+  - [评分规则](#评分规则)
+- [快速开始](#快速开始)
+  - [环境要求](#环境要求)
+  - [安装](#安装)
+  - [运行 cuSPARSE 子集评测](#运行-cusparse-子集评测)
+- [实验设计：LLM 提示策略对比](#实验设计llm-提示策略对比)
+- [技术路线与扩展计划](#技术路线与扩展计划)
 
-Each problem in ComputeEval is stored as a directory under `data`, containing:
+---
 
-```
-CUDA-0/
-├── problem-spec.yaml      # Problem metadata and configuration
-├── context/               # Files visible to the tested model/system (headers, helpers)
-│   ├── include/
-│   │   └── kernel.h       # Interface contract to implement
-│   └── helpers/
-│       └── helpers.cu     # Optional helper utilities
-├── solution/              # Reference implementation (not shown to tested model/system)
-│   └── solution.cu
-└── test/                  # Test harness (not shown to tested model/system)
-    └── test/
-        └── test_main.cu
-```
+## 背景与动机
 
-### Problem Groups
+稀疏矩阵计算是科学计算、图神经网络、大模型推理等领域的核心瓶颈。cuSPARSE 是 NVIDIA 提供的工业级稀疏线性代数库，其 Generic API 设计复杂（两阶段 buffer 模式、多种存储格式、descriptor 生命周期管理），对 LLM 的代码生成能力提出了独特挑战：
 
-Problems are organized into **groups** by domain. Each problem belongs to exactly one group, which determines the CUDA APIs and programming concepts it tests. The current groups are:
+- LLM 是否能正确选择稀疏存储格式（CSR / COO / BSR / ELLPACK）？
+- LLM 能否处理 cuSPARSE 的两阶段调用模式（`bufferSize` → `execute`）？
+- LLM 生成的稀疏算子能达到接近 roofline 的性能吗？
+- LLM 能否正确管理 handle / descriptor 的生命周期？
 
-| Group | Language | Description |
-|-------|----------|-------------|
-| `cuda-runtime` | C++ | Kernel launch, memory management, streams, events, CUDA Graphs, cluster launch, occupancy |
-| `cuda-kernels` | C++ | Shared memory, warp intrinsics, reductions, scans, stencils, tensor cores, cooperative groups |
-| `cccl` | C++ | Thrust, CUB, libcu++ |
-| `cublas` | C++ | BLAS levels 1-3, extensions, applications |
-| `mathlibs` | C++ | cuSPARSE, cuSOLVER, cuFFT, cuRAND |
-| `sparse` | C++ | cuSPARSE Generic API — SpMM, SpMV, SpSV, SpSM, SpGEMM, SDDMM, format conversion, sparse vector ops (extracted from `mathlibs` for focused sparse benchmarking; see [`SPARSE_BENCH_README.md`](SPARSE_BENCH_README.md)) |
-| `cudnn` | C++ | Convolutions, attention, matmul, normalization via cuDNN Graph API |
-| `cutile` | Python | Tile-based kernels: matmul, attention, normalization, element-wise ops (SM 10.0+) |
+SparseBench 旨在系统性地回答这些问题。
 
-You can use `--include` or `--exclude` to filter by group when generating solutions. For a full coverage map and domain backlog, see [`DOMAIN_MAP.md`](DOMAIN_MAP.md).
+---
 
-#### Problem Specification Format
+## cuSPARSE 问题集
 
-The `problem-spec.yaml` file defines each problem's metadata and configuration:
+### 完整列表
 
-```yaml
-task_id: "CUDA/0"                     # Unique identifier (generally matches directory name)
-date: "2024-12-19"                    # Problem creation date
-problem_type: cuda_cpp                # Type: cuda_cpp or cuda_python
-group: cuda-kernels                   # Domain group (see Problem Groups above)
-prompt: "Implement a CUDA kernel..."  # Problem description shown to model
+compute-eval `2026-1` 版本中，`mathlibs` 组共有 101 道题目，其中使用 cuSPARSE 的题目共 **29 道**（14 道标注为 `perf-sensitive`，含性能基准测试）。
 
-# Build and test configuration
-build_command: "nvcc -I include -o test.out solution.cu test/*.cu"
-test_command: "./test.out"
-timeout_seconds: 30.0
+| Task ID | 难度 | 核心 cuSPARSE API | 算子类型 | 性能测试 |
+|---------|------|-------------------|----------|----------|
+| `cusparse/0` | easy | `cusparseAxpby` | 稀疏向量线性组合 (axpy) | — |
+| `cusparse/1` | medium | `cusparseXcoosortByRow` | COO 矩阵行排序 | ✓ |
+| `cusparse/2` | medium | `cusparseDenseToSparse_convert` | Dense → Blocked-ELL 格式转换 | — |
+| `cusparse/3` | medium | `cusparseDenseToSparse_convert` | Dense → CSR 格式转换 | — |
+| `cusparse/4` | medium | `cusparseGather` | 稀疏向量 gather | ✓ |
+| `cusparse/5` | medium | `cusparseSgpsvInterleavedBatch` | 批量三对角系统求解 | — |
+| `cusparse/6` | medium | `cusparseSpVV` + CUDA Graph | SpVV + CUDA Graph Capture | ✓ |
+| `cusparse/7` | medium | `cusparseRot` | Givens 旋转（稀疏向量） | ✓ |
+| `cusparse/8` | medium | `cusparseScatter` | 稀疏向量 scatter | — |
+| `cusparse/9` | medium | `cusparseSDDMM` | SDDMM — BSR 格式 | ✓ |
+| `cusparse/10` | medium | `cusparseSDDMM` | 批量 SDDMM — CSR 格式 | — |
+| `cusparse/11` | medium | `cusparseSDDMM` | SDDMM — CSR 格式 | — |
+| `cusparse/12` | medium | `cusparseSparseToDense` | Sparse → Dense 格式转换 | ✓ |
+| `cusparse/13` | medium | `cusparseSpGEMM` | SpGEMM（含 workspace 管理） | ✓ |
+| `cusparse/14` | medium | `cusparseSpGEMM` | SpGEMM — CSR 格式 | — |
+| `cusparse/15` | medium | `cusparseSpMM` | SpMM — Blocked-ELL 格式 | ✓ |
+| `cusparse/16` | medium | `cusparseSpMM` | 批量 SpMM — COO 格式 | ✓ |
+| `cusparse/17` | medium | `cusparseSpMM` | SpMM — COO 格式 | — |
+| `cusparse/18` | medium | `cusparseSpMM` | 批量 SpMM — CSR 格式 | ✓ |
+| `cusparse/19` | medium | `cusparseSpMM` | SpMM — CSR 格式 | — |
+| `cusparse/20` | medium | `cusparseSpMV` | SpMV — COO 格式 | — |
+| `cusparse/21` | medium | `cusparseSpMV` | SpMV — CSR 格式 | — |
+| `cusparse/22` | medium | `cusparseSpMV` | SpMV — Sliced ELLPACK 格式 | — |
+| `cusparse/23` | medium | `cusparseSpSM` | 稀疏三角求解（矩阵 RHS）| ✓ |
+| `cusparse/24` | medium | `cusparseSpSM` | 稀疏三角求解 A×X=B | ✓ |
+| `cusparse/25` | medium | `cusparseSpSV` | 稀疏三角求解（向量 RHS）| ✓ |
+| `cusparse/26` | medium | `cusparseSpSV` | SpSV — CSR 格式 | — |
+| `cusparse/27` | medium | `cusparseSpSV` | SpSV — Sliced ELLPACK 格式 | ✓ |
+| `cusparse/28` | medium | `cusparseSpVV` | 稀疏-稠密向量点积 | — |
 
-# Requirements
-min_cuda_toolkit: "12.0"             # Minimum CUDA version required
+### 按算子族分类
 
-# Optional metadata
-metadata:
-  difficulty: medium                 # Problem difficulty level
-  tags: [kernels, memory]            # Classification tags
-  releases: [2025-1, 2025-2]         # Which releases include this problem
-  do_not_release: false              # Internal-only flag to skip CI
+| 算子族 | 问题数 | Task IDs | 说明 |
+|--------|--------|----------|------|
+| **SpMM**（稀疏矩阵 × 稠密矩阵） | 5 | 15, 16, 17, 18, 19 | 支持 CSR / COO / Blocked-ELL，含批量版本 |
+| **SpMV**（稀疏矩阵 × 向量） | 3 | 20, 21, 22 | 支持 CSR / COO / Sliced-ELLPACK |
+| **SpSV**（稀疏三角求解，向量 RHS） | 3 | 25, 26, 27 | 支持 CSR / Sliced-ELLPACK |
+| **SpSM**（稀疏三角求解，矩阵 RHS） | 2 | 23, 24 | 下三角矩阵，多 RHS |
+| **SpGEMM**（稀疏矩阵 × 稀疏矩阵） | 2 | 13, 14 | 含 workspace 两阶段管理 |
+| **SDDMM**（Sampled Dense-Dense MM） | 3 | 9, 10, 11 | 支持 CSR / BSR，含批量版本 |
+| **格式转换**（Dense ↔ Sparse） | 3 | 2, 3, 12 | Dense→CSR / Dense→Blocked-ELL / Sparse→Dense |
+| **稀疏向量运算** | 6 | 0, 4, 6, 7, 8, 28 | axpy / gather / scatter / Givens旋转 / SpVV |
+| **矩阵排序** | 1 | 1 | COO 按行排序 |
+| **批量三对角求解** | 1 | 5 | `GpsvInterleavedBatch`，cuBLAS 混用 |
 
-source_references: null              # Optional: required API calls/symbols to verify
-                                     #  - string: single item must be present
-                                     #  - list of strings: all must be present
-                                     #  - {any: [...]} at least one must be present
-                                     #  - {all: [...]} all must be present
-                                     #  - {all: [...], any: [...]} combines both
-```
+---
 
-Example with source references requiring specific CUDA APIs:
+## 评测体系设计
 
-```yaml
-source_references:
-  all: [cudaMalloc, cudaFree]        # Must use both malloc and free
-  any: [cudaMemcpy, cudaMemcpyAsync] # Must use at least one copy method
-```
+### 评测维度
 
-### Evaluation Rules of Engagement
-
-ComputeEval follows a strict separation between what systems/models see during generation versus what is used during evaluation:
-
-**What the system/model sees (generation time):**
-- Problem `prompt` - describes the task and requirements
-- `context_files` - headers defining interfaces, optional helper utilities
-- `build_command` - compilation instructions and flags
-- Minimum CUDA toolkit version and architecture requirements
-
-**What the system/model does NOT see:**
-- `test_files` - held-out test harness that validates correctness
-- `solution` - reference implementation directory
-
-**During evaluation:**
-1. A temporary workspace is created
-2. `context_files` are written to the workspace
-3. `test_files` are written to the workspace (now visible)
-4. The model-generated solution files are written to the workspace
-5. The `build_command` is executed to compile the unified workspace
-6. If compilation succeeds, the `test_command` is executed
-7. Test exit code determines pass/fail
-
-This ensures models cannot overfit to test cases and must solve problems based solely on the problem description and interface contracts.
-
-### Continuous Integration Validation
-
-Every problem in the repository includes a known-good reference solution. Our CI pipeline continuously validates the integrity of the benchmark by:
-
-1. Running the evaluation procedure on each problem's reference solution
-2. Verifying that build commands compile successfully
-3. Ensuring test harnesses execute correctly and pass
-4. Validating that problem specifications are well-formed
-
-This guarantees that all released problems are solvable and correctly specified.
-
-### Performance Measurement
-
-Problems can opt into performance measurement by declaring a `benchmark_command` in their `problem-spec.yaml`. This enables comparison of LLM-generated solutions against a known baseline on real GPU workloads.
-
-#### Opting In
-
-Add `benchmark_command` and optionally `timing_mode` to your problem spec:
-
-```yaml
-# Functional correctness (required)
-test_command: "./test.out"
-
-# Performance measurement (optional)
-benchmark_command: "./benchmark.out"
-timing_mode:
-  type: region
-  include: ["matmul*"]
-```
-
-The `benchmark_command` is fundamentally different from `test_command`:
-
-- **`test_command`** validates correctness — it tests edge cases, boundary conditions, and error handling
-- **`benchmark_command`** exercises a typical workload — it simulates realistic GPU work that can be profiled and compared against a baseline solution
-
-The benchmark command runs only after the solution passes all functional tests. If a `baseline_solution` is provided for the problem, the framework computes speedup as `baseline_time / solution_time`.
-
-#### Timing Modes
-
-The `timing_mode` field controls how performance timing is extracted. All modes report values in **milliseconds**.
-
-| Mode | Type | Description |
-|------|------|-------------|
-| `process` | Default | Total application wall-clock time (`application_duration_ms` from profiler summary) |
-| `kernels` | Profiler | Sum of GPU kernel execution time. Supports `include`/`exclude` glob patterns to filter by kernel name |
-| `region` | Profiler | Timing from NVTX-annotated code ranges. Supports `include`/`exclude` globs and `time_type` (`"kernel"` or `"wall_clock"`) |
-| `gpu` | Profiler | Total GPU time: kernel execution + memory transfers |
-| `custom` | Self-reported | The benchmark program prints its own timing to STDOUT (see below) |
-
-The profiler-based modes (`process`, `kernels`, `region`, `gpu`) require a `--profile_mode` to be specified at evaluation time (see [Profiling Modes](#profiling-modes)). The `custom` mode does not require a profiler.
-
-**Timing mode examples in `problem-spec.yaml`:**
-
-```yaml
-# Default: total application wall-clock time
-# (timing_mode defaults to "process" if omitted)
-timing_mode:
-  type: process
-
-# Only count specific kernels
-timing_mode:
-  type: kernels
-  include: ["matmul_*", "*_optimized"]
-  exclude: ["debug_*"]
-
-# NVTX region kernel time (time_type defaults to "kernel")
-timing_mode:
-  type: region
-  include: ["PerfTest*"]
-
-# NVTX region wall-clock time (overrides the default time_type)
-timing_mode:
-  type: region
-  include: ["PerfTest*"]
-  time_type: wall_clock
-
-# Total GPU time (kernels + memory transfers)
-timing_mode:
-  type: gpu
-
-# Self-reported timing from STDOUT
-timing_mode:
-  type: custom
-```
-
-#### Region Timing with NVTX
-
-The `region` timing mode uses [NVTX](https://nvidia.github.io/NVTX/) (NVIDIA Tools Extension) to measure annotated code ranges. Problem authors wrap the performance-critical section of their benchmark with NVTX push/pop calls, and the profiler attributes kernel execution and wall-clock time to those ranges.
-
-**C++ (NVTX is included in the CUDA Toolkit):**
-
-```cpp
-#include <nvToolsExt.h>
-
-// In your benchmark harness:
-nvtxRangePushA("matmul_benchmark");
-matmul_kernel<<<grid, block>>>(A, B, C, N);
-cudaDeviceSynchronize();
-nvtxRangePop();
-```
-
-**Python (the `nvtx` package is pre-installed in evaluation containers):**
-
-```python
-import nvtx
-
-# As a context manager:
-with nvtx.annotate("matmul_benchmark"):
-    result = my_matmul(A, B)
-    torch.cuda.synchronize()
-
-# Or as a decorator:
-@nvtx.annotate("matmul_benchmark")
-def run_benchmark():
-    return my_matmul(A, B)
-```
-
-#### Custom Timing
-
-The `custom` timing mode lets the benchmark program report its own wall-clock time. This is useful when you need full control over timing (e.g., using CUDA events, excluding warmup iterations, or timing host-side logic).
-
-The benchmark program must print a line to STDOUT matching this format:
+SparseBench 从三个正交维度评测 LLM 生成代码的质量：
 
 ```
-COMPUTE_EVAL_TIME_MS: <value>
+综合得分 = 正确性 (50%) + 性能 (30%) + 代码质量 (20%)
 ```
 
-The value must be in **milliseconds**. If multiple matching lines are printed (e.g., warmup iterations), the last one is used.
+对于非 `perf-sensitive` 题目，性能权重转入正确性，变为 `正确性 (80%) + 代码质量 (20%)`。
 
-**C++:**
+#### 1. 正确性（Functional Correctness）
 
-```cpp
-cudaEvent_t start, stop;
-cudaEventCreate(&start);
-cudaEventCreate(&stop);
+测试输入覆盖以下稀疏矩阵场景：
 
-cudaEventRecord(start);
-my_kernel<<<grid, block>>>(args);
-cudaEventRecord(stop);
-cudaEventSynchronize(stop);
+| 场景 | 稀疏率 | 矩阵类型 |
+|------|--------|----------|
+| 轻度稀疏 | 50% | 随机 |
+| 中度稀疏 | 90% | 随机 / 对角带状 |
+| 高度稀疏 | 99% | 随机 / 分块结构 |
+| 真实矩阵 | 变化 | SuiteSparse Matrix Collection |
 
-float ms = 0;
-cudaEventElapsedTime(&ms, start, stop);
-printf("COMPUTE_EVAL_TIME_MS: %f\n", ms);
-```
+数值验证：与 CPU 端 `scipy.sparse` 或 cuBLAS 稠密结果对比，容差 `1e-5`（FP32）/ `1e-10`（FP64）。
 
-**Python:**
+#### 2. 性能（Performance，仅 perf-sensitive 题目）
 
-```python
-import torch
+| 指标 | 定义 | 目标 |
+|------|------|------|
+| GFLOPS 效率 | 实测 GFLOPS / 理论峰值 GFLOPS | > 50% |
+| 内存带宽效率 | 实测带宽 / GPU 峰值带宽 | > 60% |
+| 相对基准加速比 | 生成方案时间 / 基准方案时间 | ≥ 0.8× |
 
-start = torch.cuda.Event(enable_timing=True)
-end = torch.cuda.Event(enable_timing=True)
+性能分级：`>80% roofline` = 优秀，`50–80%` = 良好，`<50%` = 不及格。
 
-start.record()
-result = my_function(A, B)
-end.record()
-torch.cuda.synchronize()
+#### 3. 代码质量（API 规范性）
 
-elapsed_ms = start.elapsed_time(end)
-print(f"COMPUTE_EVAL_TIME_MS: {elapsed_ms}")
-```
+静态检查（编译阶段）：
+- Handle / Descriptor 是否配对创建与销毁（`cusparseCreate` ↔ `cusparseDestroy`）
+- `CUSPARSE_CHECK` 或等价错误处理是否完整覆盖每次 API 调用
+- `bufferSize` → `allocate` → `execute` 三段式调用是否完整
 
-#### Profiling Modes
+动态检查（运行阶段）：
+- `cuda-sanitizer` 检测内存越界与未初始化访问
+- Nsight Systems 检测不必要的 host-device 同步点
 
-When evaluating solutions, the `--profile_mode` flag controls which profiler is used to collect GPU metrics. This applies to all timing modes except `custom`.
-
-| Mode | Description |
-|------|-------------|
-| *(not set)* | No performance profiling. Functional correctness only. |
-| `cupti` | Lightweight profiler using CUPTI via `LD_PRELOAD`. Collects kernel timing, memory transfers, and NVTX ranges. Lower overhead, suitable for most workloads. |
-| `ncu` | NVIDIA Nsight Compute profiler. Collects detailed metrics including SM throughput and DRAM throughput percentages. Requires GPU profiling permissions. Higher overhead — reduce `n_workers` to avoid contention. |
-
-### Release Datapacks
-
-For production use, ComputeEval distributes problems as **datapacks** - versioned, immutable releases stored as compressed tarballs (`.tar.gz`):
+### 评测流水线
 
 ```
-data/releases/
-├── 2025-1-problems.tar.gz
-├── 2025-2-problems.tar.gz
-├── 2025-3-problems.tar.gz
-├── 2026-1-problems.tar.gz
+问题 Prompt
+    │
+    ▼
+LLM 代码生成（支持 zero-shot / few-shot / CoT / RAG）
+    │
+    ▼
+编译（nvcc + cuSPARSE 链接）
+    │  ✗ 编译失败 → 记录 0 分
+    ▼
+正确性测试（多组稀疏矩阵输入）
+    │  ✗ 测试失败 → 记录正确性分
+    ▼
+性能 Benchmark（仅 perf-sensitive）
+    │
+    ▼
+API 规范性检查（静态 + 动态）
+    │
+    ▼
+综合评分输出
 ```
 
-#### Datapack Structure
+与 compute-eval 原有框架的集成点：
+- 一次性运行 `scripts/create_sparse_datapack.py` 生成 `sparse` 专属 datapack
+- 使用 `--include=sparse` 直接定位稀疏算子题目，无需在大 mathlibs 组中二次过滤
+- 使用 `--profile_mode=ncu` 开启 Nsight Compute 性能剖析
+- 扩展 `profilers/` 模块添加稀疏矩阵专用 GFLOPS 计算
 
-Each datapack contains:
-- **`metadata.json`** - Release version, creation timestamp, problem count, and integrity hashes
-- **`problems.jsonl`** or **`solutions.jsonl`** - One JSON object per line representing each problem/solution
+### 评分规则
 
-Problems in datapacks are serialized as JSON objects rather than directories. Each problem includes:
-- All fields from `problem-spec.yaml`
-- Embedded `context_files` (list of `{path, content}` objects)
-- Embedded `test_files` (held-out, for evaluation only)
+```json
+{
+  "task_id": "cusparse/19",
+  "correctness_score": 1.0,
+  "performance_score": 0.82,
+  "quality_score": 0.9,
+  "final_score": 0.918,
+  "details": {
+    "test_cases_passed": "5/5",
+    "gflops_efficiency": "82%",
+    "handle_leak": false,
+    "error_handling_complete": true
+  }
+}
+```
 
-This format provides:
-- **Immutability** - Released benchmarks never change
-- **Integrity** - MD5 hashes verify problem consistency
-- **Portability** - Self-contained archives easy to distribute
-- **Versioning** - Clear separation between releases
+---
 
-#### Release Support
+## 快速开始
 
-ComputeEval follows a continuous delivery model. New problems and improvements are released regularly as versioned datapacks.
-
-We are committed to **permanently supporting all previous releases**. Model developers can benchmark against any release version to:
-- Track progress over time against a fixed baseline
-- Compare results with published benchmarks
-- Ensure reproducibility of evaluation results
-
-
-## Setup
-
-### Prerequisites
+### 环境要求
 
 - Python 3.10+
-- NVIDIA GPU with CUDA Toolkit 12 or greater (for evaluation)
+- CUDA Toolkit 12.0+（评测阶段必须）
+- NVIDIA GPU，计算能力 ≥ 7.0（V100 / A100 / H100 推荐）
+- Docker（推荐，用于隔离执行生成代码）
 
-### Installation
-
-Install the package using uv:
+### 安装
 
 ```bash
+git clone <repo-url>
+cd compute-eval
 uv sync
 ```
 
-### Pre-commit Hooks
+### 运行 cuSPARSE 子集评测
 
-Set up pre-commit hooks for code quality:
-
-```bash
-uv sync --group dev
-uv run pre-commit install
-```
-
-### API Keys
-
-To query an LLM, you must first obtain an API key from the respective service.
-
-#### NVIDIA NIM
-
-To use ComputeEval with NVIDIA-hosted models, you need an API key from
-[build.nvidia.com](https://build.nvidia.com).
-
-1. Go to [build.nvidia.com](https://build.nvidia.com)
-1. Sign in with your account
-1. Verify that you have sufficient credits to call hosted models
-1. Navigate to the desired model and click on it
-1. Click on `Get API Key`
-1. Copy the generated API key
-1. Export it as an environment variable:
+**第零步（一次性）：生成 sparse 专属 datapack**
 
 ```bash
-export NEMO_API_KEY="<your-nvidia-key>"
+# 从 mathlibs datapack 中提取 29 道 cuSPARSE 题目，写入独立的 sparse datapack
+uv run python scripts/create_sparse_datapack.py
+# 输出：data/releases/2026-1-sparse-problems.tar.gz
 ```
 
-#### OpenAI
+完成后，后续所有命令只需 `--include=sparse`，无需在结果里二次过滤。
 
-Follow the instructions in the [OpenAI docs](https://openai.com/index/openai-api),
-then:
-
-```bash
-export OPENAI_API_KEY="<your-openai-key>"
-```
-
-#### Anthropic (Claude)
-
-Follow instruction on [Anthropic docs](https://www.anthropic.com/api), then:
-
-```bash
-export ANTHROPIC_API_KEY="<your-anthropic-key>"
-```
-
-## Usage
-
-**Note:** This repository executes machine-generated CUDA code.
-While it's unlikely that the code is malicious, it could still pose potential risks.
-Therefore, all code execution requires the `--mode` flag to be set explicitly to `docker` or `local`.
-We strongly recommend using Docker mode or a sandbox environment (e.g., a virtual machine) when running generated code to minimize security risks.
-
-### Using Preset NIM Models
-
-To generate solutions using NVIDIA-hosted models:
+**第一步：生成代码**
 
 ```bash
 uv run compute_eval generate_samples \
   --release=2026-1 \
-  --base_url=https://integrate.api.nvidia.com/v1 \
-  --model=openai/gpt-oss-120b \
-  --solutions_per_problem=3 \
-  --n_workers=10
+  --include=sparse \
+  --problems_datapack_dir=data/releases/ \
+  --model=claude-opus-4-6 \
+  --solutions_per_problem=5 \
+  --n_workers=8
 ```
 
-**Note:** Set `NEMO_API_KEY` environment variable when using preset NIM models.
-
-This will:
-- Read problems from the 2026-1 release datapack
-- Generate 3 solutions per problem using the `openai/gpt-oss-120b` model
-- Write all solutions to: `2026-1-openai-gpt-oss-120b-solutions.tar.gz`
-
-You can find the list of available models at [NVIDIA NIM Model Catalog](https://build.nvidia.com/models).
-
-### Using OpenAI-Compatible APIs
-
-For models with OpenAI-compatible API endpoints:
-
-```bash
-uv run compute_eval generate_samples \
-  --release=2026-1 \
-  --model=gpt-5 \
-  --solutions_per_problem=3 \
-  --n_workers=10
-```
-
-**Note:** Set `OPENAI_API_KEY` environment variable when using custom OpenAI-compatible endpoints.
-
-This will:
-- Read problems from the 2026-1 release datapack
-- Generate 3 solutions per problem using the `gpt-5` model
-- Write all solutions to: `2026-1-gpt-5-solutions.tar.gz`
-
-### Using Configuration Files
-
-You can also use YAML configuration files for convenience:
-
-```yaml
-# config.yaml
-release: 2026-1
-model: gpt-5
-solutions_per_problem: 3
-n_workers: 10
-```
-
-```bash
-uv run compute_eval generate_samples --config_file=config.yaml
-```
-
-CLI arguments override config file values.
-
-### Generating and Evaluating Solutions
-
-After generating solutions (see examples above), evaluate them with:
+**第二步：正确性评测**
 
 ```bash
 uv run compute_eval evaluate_functional_correctness \
   --release=2026-1 \
-  --solutions_datapack=2026-1-gpt-5-solutions.tar.gz \
+  --solutions_datapack=2026-1-claude-opus-4-6-solutions.tar.gz \
+  --problems_datapack_dir=data/releases/ \
   --mode=docker \
-  --k='(1, 3)' \
+  --k='(1, 3, 5)' \
   --n_workers=4
 ```
 
-**Security Note:** You must pass `--mode=docker` (or `--mode=local`) to run the evaluation. As described in the Evaluation Rules of Engagement section, this executes untrusted model-generated code, so use appropriate sandboxing. Docker mode is recommended.
-
-This will:
-- Read the problems and solutions datapacks
-- Build and execute each solution in an isolated workspace with the test harness
-- Output structured JSON with `pass@k` metrics and problem count
-- Write results to a graded solutions file (auto-named per datapack, e.g., `2026-1-gpt-5-graded-solutions.jsonl`)
-
-**Note:** The `k` parameter can be a single integer (`--k=1`) or a tuple (`--k='(1, 3)'`). For accurate pass@k estimates, ensure `max(k) <= solutions_per_problem`.
-
-## Command Reference
-
-### `generate_samples`
-
-Generates solutions for all problems in a release datapack using a specified model or custom API endpoint.
-
-#### Configuration Parameters
-
-All parameters can be specified in a YAML config file or passed as CLI arguments (CLI arguments take precedence).
-
-- `release` (str): Release version to generate solutions for (e.g., "2025-3") (default: "2026-1")
-- `include` (list[str] | None): Comma-separated list of groups to include (e.g., `"cuda-kernels,cublas"`). Mutually exclusive with `exclude`. If not set, all groups are included. (default: None)
-- `exclude` (list[str] | None): Comma-separated list of groups to exclude. Mutually exclusive with `include`. If not set, no groups are excluded. (default: None)
-- `problems_datapack_dir` (str): Directory where released problem datapacks are stored (default: "data/releases/")
-- `solutions_per_problem` (int): Number of solutions to generate per problem (default: 1)
-- `n_workers` (int): Number of worker threads to use (default: 10)
-- `system_prompt` (str): System prompt for the model (default: predefined CUDA programming prompt)
-- `model` (str): Model to use (use an appropriate NIM or use an OpenAI model name) (required)
-- `base_url` (str | None): Custom API base URL (default: None)
-- `reasoning` (str | None): Reasoning level for OpenAI models (e.g., "low", "medium", "high") (default: None)
-- `temperature` (float): Sampling temperature for generation (default: 1.0)
-- `top_p` (float): Nucleus sampling parameter (default: Model dependent)
-- `max_tokens` (int | None): Maximum tokens to generate (default: None, model dependent)
-- `temp_dir` (str | None): Temporary directory for intermediate results (default: None)
-- `debug` (bool): Include system prompt, prompt, and completion in output for debugging (default: False)
-
-**Note**: `model` must be specified.
-
-### `evaluate_functional_correctness`
-
-Evaluates the functional correctness of generated solutions by compiling and executing them against held-out test suites. Outputs structured JSON with `pass@k` metrics.
-
-#### Configuration Parameters
-
-All parameters can be specified in a YAML config file or passed as CLI arguments (CLI arguments take precedence).
-
-- `release` (str): Release version to evaluate solutions for (e.g., "2025-3") (default: "2026-1")
-- `solutions_datapack` (str): Path to a solutions datapack file or a directory containing multiple `*-solutions.tar.gz` files for batch evaluation (required)
-- `problems_datapack_dir` (str): Directory where released problem datapacks are stored (default: "data/releases/")
-- `mode` (str | None): Evaluation execution mode. Must be set to `"docker"` or `"local"` to allow execution (default: None)
-- `k` (int | tuple[int, ...]): K value(s) for pass@k evaluation (default: 1)
-- `n_workers` (int): Number of worker threads (default: 4)
-- `profile_mode` (str | None): Profiling mode for performance analysis. `"cupti"` for lightweight CUPTI profiling, `"ncu"` for NVIDIA Nsight Compute, or `None` (default) to disable profiling. Only affects problems that declare a `benchmark_command`.
-
-#### Performance Profiling
-
-To enable performance profiling during evaluation, pass `--profile_mode`:
+**第三步：性能评测（可选，需要本地 GPU）**
 
 ```bash
 uv run compute_eval evaluate_functional_correctness \
   --release=2026-1 \
-  --solutions_datapack=2026-1-gpt-5-solutions.tar.gz \
-  --mode=local \
-  --profile_mode=cupti \
-  --n_workers=2
-```
-
-When profiling is enabled, problems with a `benchmark_command` will be profiled after passing functional tests. The results include timing, throughput, and optional speedup metrics against baseline solutions.
-
-**Using Nsight Compute (`ncu`):**
-
-The `ncu` profiler collects detailed per-kernel metrics (SM throughput, DRAM throughput) but requires GPU profiling permissions and has higher overhead. Reduce `n_workers` (e.g., to 2) to avoid GPU contention.
-
-```bash
-uv run compute_eval evaluate_functional_correctness \
-  --release=2026-1 \
-  --solutions_datapack=data/releases/2026-1-baseline-solutions.tar.gz \
+  --solutions_datapack=2026-1-claude-opus-4-6-solutions.tar.gz \
+  --problems_datapack_dir=data/releases/ \
   --mode=local \
   --profile_mode=ncu \
   --n_workers=2
 ```
 
-**Example Output:**
+评测结果已按 `sparse` 组自动聚合，JSON 输出中 `metrics_by_group.sparse` 即为 cuSPARSE 专项指标，无需额外过滤。
 
-```json
-{
-  "pass_at_k": {
-    "skipped": 0.0,
-    "pass@1": 1.0
-  },
-  "problem_count": 5,
-  "performance_analysis": {
-    "invalid_skipped": 1,
-    "avg_solution_time_ms": 0.065,
-    "avg_sm_throughput_pct": 45.2,
-    "avg_dram_throughput_pct": 23.8
-  }
-}
+---
+
+## 实验设计：LLM 提示策略对比
+
+SparseBench 支持以下四种提示策略的对比实验，以研究哪种方式最有助于 LLM 正确生成 cuSPARSE 代码：
+
+| 策略 | 描述 | 适用场景 |
+|------|------|----------|
+| **Zero-shot** | 仅提供问题描述，无示例 | 评测模型基础能力 |
+| **Few-shot** | 提供 1–3 个 cuSPARSE 正确示例 | 评测上下文学习效果 |
+| **Chain-of-Thought** | 要求模型先规划 API 调用流程再写代码 | 评测推理链对复杂 API 的帮助 |
+| **RAG 增强** | 自动检索 cuSPARSE 官方文档片段注入 Prompt | 评测外部知识对正确率的提升 |
+
+使用 `--system_prompt` 参数或配置文件指定不同策略：
+
+```yaml
+# few_shot_config.yaml
+release: 2026-1
+include: [sparse]
+problems_datapack_dir: data/releases/
+model: claude-opus-4-6
+solutions_per_problem: 5
+system_prompt: |
+  You are an expert CUDA programmer. Here is an example of correct cuSPARSE usage:
+
+  // SpMV example
+  cusparseSpMatDescr_t matA;
+  cusparseCreateCsr(&matA, rows, cols, nnz, ...);
+  cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                          &alpha, matA, vecX, &beta, vecY,
+                          CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+  cudaMalloc(&dBuffer, bufferSize);
+  cusparseSpMV(handle, ...);
+  cusparseDestroySpMat(matA);
+
+  Now implement the following function:
 ```
 
-## Dataset
+**关键研究问题：**
 
-For more information about the dataset see [`DATASET_CARD.md`](DATASET_CARD.md).
-For a full coverage map and ecosystem backlog see [`DOMAIN_MAP.md`](DOMAIN_MAP.md).
+1. **格式选择**：LLM 是否能根据矩阵结构自动选择最优存储格式？
+2. **两阶段 API**：LLM 能否正确处理 `bufferSize` → `execute` 的调用模式？
+3. **高稀疏度鲁棒性**：在稀疏率 > 99% 时，生成代码是否仍然正确？
+4. **性能意识**：LLM 能否在不提示的情况下选择高效算法（如 `CUSPARSE_SPMM_ALG_DEFAULT` vs 手动选择）？
+5. **错误处理**：LLM 是否会自发添加完整的 `CUSPARSE_CHECK` 宏？
 
-## License
+---
 
-The code in this repository is licensed under [Apache 2.0](LICENSE).
+## 技术路线与扩展计划
 
-The dataset (everything under `data/`) is licensed under the [NVIDIA Evaluation
-Dataset License Agreement](data/LICENSE). This license permits use of the dataset
-**solely for evaluation and benchmarking of AI models**. In particular, the
-dataset **may not be used for training AI models** (Section 3.1). You may publish
-or otherwise disclose evaluation results.
+### 当前阶段（Phase 1）：基础评测
 
-## Contributing
+- [x] 筛选 29 道 cuSPARSE 题目，建立子集评测流程
+- [x] 复用 compute-eval 正确性评测框架
+- [x] 集成 Nsight Compute 性能剖析（`--profile_mode=ncu`）
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development instructions.
+### Phase 2：稀疏专用评测扩展
+
+- [ ] 添加多种稀疏矩阵生成器（随机 / 带状 / 块对角 / 真实矩阵）
+- [ ] 实现基于 GFLOPS 和带宽效率的稀疏性能评分
+- [ ] 添加 API 规范性静态检查模块（handle 泄漏 / error handling 覆盖）
+
+### Phase 3：题目类型扩展
+
+在现有 **Generation** 类型基础上，新增：
+
+| 题目类型 | 描述 | 示例 |
+|----------|------|------|
+| **Optimization** | 优化已有正确但低效的 cuSPARSE 代码 | 选择更优 SpMM algorithm，调整 workspace 策略 |
+| **Repair** | 修复包含常见错误的代码 | 修复遗漏 `cusparseSpMM_preprocess` 调用 |
+| **Translation** | 将 Legacy API 迁移到 Generic API | `cusparseDcsrmv` → `cusparseSpMV` |
+
+### Phase 4：新库覆盖
+
+参考 [DOMAIN_MAP.md](DOMAIN_MAP.md) 中的 gap，扩展至：
+
+| 库 | 说明 |
+|----|------|
+| **cuSPARSELt** | 2:4 结构化稀疏（Ampere+ 专用，适合稀疏 Transformer） |
+| **cuDSS** | 直接稀疏求解器（LU / Cholesky 分解） |
+| **混合精度 SpMM** | FP16 / BF16 稀疏矩阵乘法 |
+
+---
+
+## 数据集与许可
+
+问题集来自 compute-eval `2026-1` 发布版，遵循 [NVIDIA Evaluation Dataset License Agreement](data/LICENSE)。
+
+- 数据集**仅可用于 AI 模型的评测与基准测试**，不可用于训练。
+- 代码部分遵循 [Apache 2.0](LICENSE)。
+
+---
+
+## 引用
+
+如果本项目对您的研究有帮助，请引用 compute-eval 原始项目，并注明使用了 SparseBench 稀疏矩阵评测子集。
+
+---
+
+*SparseBench 基于 [ComputeEval](README.md) 构建 | 当前版本：2026-1 | 问题数：29（cuSPARSE）*
