@@ -118,7 +118,7 @@ class Datapack(ABC):
     ):
         file_path = Path(os.path.expanduser(file_path))
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as tmp:
             tmp_path = tmp.name
 
             try:
@@ -135,6 +135,7 @@ class Datapack(ABC):
                     cls._write_item(item, tmp, metadata)
 
                 tmp.flush()
+                tmp.close()  # Must close before tar.add on Windows (no open-file deletion)
 
                 # Create the tar.gz data pack
                 with tarfile.open(file_path, "w:gz") as tar:

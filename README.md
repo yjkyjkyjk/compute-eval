@@ -1,8 +1,11 @@
 # SparseBench
 
-**SparseBench** 是基于 [ComputeEval](README.md) 构建的针对 LLM 生成**稀疏矩阵算子**代码的专项评测体系，聚焦于 NVIDIA cuSPARSE 库的正确性、性能与 API 规范性三个维度。
+**SparseBench** 是基于 [ComputeEval](README.md) 构建的针对 LLM 生成**稀疏矩阵算子**代码的专项评测体系，包含两个互补的问题集：
 
-> 本项目在 `mathlibs` 组的 101 道题目基础上，筛选并扩展了全部 29 道 cuSPARSE 问题，同时设计了一套面向稀疏计算场景的评测方法论。
+- **cuSPARSE 组**（29 题）：聚焦 NVIDIA cuSPARSE 库的正确性、性能与 API 规范性；
+- **custom_sparse 组**（5 题）：使用与 cuSPARSE 问题相同的接口和测试代码，但**禁用 cuSPARSE**，要求 LLM 从零实现底层 CUDA 核函数。
+
+> 本项目在 `mathlibs` 组的 101 道题目基础上，筛选并扩展了全部 29 道 cuSPARSE 问题；同时新增了 5 道自定义算子题目，用于单独评测 LLM 对 CUDA 稀疏计算内核的设计能力。
 
 ---
 
@@ -12,6 +15,7 @@
 - [cuSPARSE 问题集](#cusparse-问题集)
   - [完整列表](#完整列表)
   - [按算子族分类](#按算子族分类)
+- [custom\_sparse 问题集（自定义 CUDA 核）](#custom_sparse-问题集自定义-cuda-核)
 - [评测体系设计](#评测体系设计)
   - [评测维度](#评测维度)
   - [评测流水线](#评测流水线)
@@ -20,6 +24,7 @@
   - [环境要求](#环境要求)
   - [安装](#安装)
   - [运行 cuSPARSE 子集评测](#运行-cusparse-子集评测)
+  - [运行 custom\_sparse 评测](#运行-custom_sparse-评测)
 - [实验设计：LLM 提示策略对比](#实验设计llm-提示策略对比)
 - [技术路线与扩展计划](#技术路线与扩展计划)
 
@@ -90,6 +95,34 @@ compute-eval `2026-1` 版本中，`mathlibs` 组共有 101 道题目，其中使
 | **稀疏向量运算** | 6 | 0, 4, 6, 7, 8, 28 | axpy / gather / scatter / Givens旋转 / SpVV |
 | **矩阵排序** | 1 | 1 | COO 按行排序 |
 | **批量三对角求解** | 1 | 5 | `GpsvInterleavedBatch`，cuBLAS 混用 |
+
+---
+
+## custom_sparse 问题集（自定义 CUDA 核）
+
+`custom_sparse` 组包含 **5 道**题目，与对应 cuSPARSE 题目使用**完全相同的函数接口和测试代码**，但编译命令中去掉了 `-lcusparse`。LLM 必须用原生 CUDA 核函数实现稀疏计算逻辑，无法调用任何稀疏库。
+
+| Task ID | 对应 cuSPARSE 题 | 操作 | 核心实现要点 |
+|---------|-----------------|------|-------------|
+| `custom_sparse/0` | cusparse/21 | SpMV CSR | warp-per-row + `__shfl_down_sync` warp 规约 |
+| `custom_sparse/1` | cusparse/19 | SpMM CSR | 线程级 (row, B_col) 计算，列主序输出 |
+| `custom_sparse/2` | cusparse/28 | SpVV 点积 | 共享内存块内规约 + `atomicAdd` 合并 |
+| `custom_sparse/3` | cusparse/0  | 稀疏 axpby | 全量 scale 核 + scatter-add 核 |
+| `custom_sparse/4` | cusparse/3  | Dense → CSR | 逐行计数核 + Thrust prefix sum + 填充核 |
+
+**与 cuSPARSE 题目的关键差异：**
+
+- 编译命令为 `nvcc -I include -o test.out solution.cu test/*.cu -arch=native`（无 `-lcusparse`）
+- `cuda_helpers.h` 仅提供 `CHECK_CUDA`，不含 `<cusparse.h>` 或 `CHECK_CUSPARSE`
+- 函数名加 `_custom` 后缀（如 `spmv_csr_custom`），接口语义与库版本完全一致
+- 所有题目均标注 `perf-sensitive`，配有 NVTX bench region 用于性能剖析
+
+**生成 datapack：**
+
+```bash
+python scripts/create_custom_sparse_problems.py
+# 输出：data/releases/2026-1-custom-sparse-problems.tar.gz
+```
 
 ---
 
@@ -256,6 +289,53 @@ uv run compute_eval evaluate_functional_correctness \
 
 评测结果已按 `sparse` 组自动聚合，JSON 输出中 `metrics_by_group.sparse` 即为 cuSPARSE 专项指标，无需额外过滤。
 
+### 运行 custom_sparse 评测
+
+**第零步（一次性）：生成 custom_sparse datapack**
+
+```bash
+python scripts/create_custom_sparse_problems.py
+# 输出：data/releases/2026-1-custom-sparse-problems.tar.gz
+```
+
+**第一步：生成代码**
+
+```bash
+uv run compute_eval generate_samples \
+  --release=2026-1 \
+  --include=sparse \
+  --problems_datapack=data/releases/2026-1-custom-sparse-problems.tar.gz \
+  --model=claude-opus-4-6 \
+  --solutions_per_problem=5 \
+  --n_workers=8
+```
+
+**第二步：正确性评测**
+
+```bash
+uv run compute_eval evaluate_functional_correctness \
+  --release=2026-1 \
+  --solutions_datapack=2026-1-claude-opus-4-6-solutions.tar.gz \
+  --problems_datapack=data/releases/2026-1-custom-sparse-problems.tar.gz \
+  --mode=docker \
+  --k='(1, 3, 5)' \
+  --n_workers=4
+```
+
+**第三步：性能评测（可选，需要本地 GPU）**
+
+```bash
+uv run compute_eval evaluate_functional_correctness \
+  --release=2026-1 \
+  --solutions_datapack=2026-1-claude-opus-4-6-solutions.tar.gz \
+  --problems_datapack=data/releases/2026-1-custom-sparse-problems.tar.gz \
+  --mode=local \
+  --profile_mode=ncu \
+  --n_workers=2
+```
+
+> **提示：** 与 cuSPARSE 题目对比时，可在同一 LLM 上分别运行两套 datapack，比较 `pass@k` 与性能得分——cuSPARSE 组测试 API 调用能力，custom_sparse 组测试底层核函数设计能力。
+
 ---
 
 ## 实验设计：LLM 提示策略对比
@@ -311,6 +391,7 @@ system_prompt: |
 - [x] 筛选 29 道 cuSPARSE 题目，建立子集评测流程
 - [x] 复用 compute-eval 正确性评测框架
 - [x] 集成 Nsight Compute 性能剖析（`--profile_mode=ncu`）
+- [x] 新增 5 道 custom_sparse 题目（禁用 cuSPARSE，要求手写 CUDA 核函数）
 
 ### Phase 2：稀疏专用评测扩展
 
@@ -355,4 +436,4 @@ system_prompt: |
 
 ---
 
-*SparseBench 基于 [ComputeEval](README.md) 构建 | 当前版本：2026-1 | 问题数：29（cuSPARSE）*
+*SparseBench 基于 [ComputeEval](README.md) 构建 | 当前版本：2026-1 | 问题数：29（cuSPARSE）+ 5（custom_sparse）*
